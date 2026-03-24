@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Filament\Resources\IngestSignals\IngestSignalResource\Pages;
+namespace App\Filament\Resources\IngestSignals\Pages; // EXAKT DIESER PFAD
 
 use App\Filament\Resources\IngestSignals\IngestSignalResource;
 use Filament\Actions;

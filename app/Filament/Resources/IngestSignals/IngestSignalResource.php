@@ -1,10 +1,8 @@
 <?php
 
 // HIER IST DER MAGISCHE FIX: Der exakte Ordnerpfad!
-namespace App\Filament\Resources\IngestSignals;
+namespace App\Filament\Resources\IngestSignals; // Muss exakt so sein
 
-// Der Pfad zu deinen Pages muss ebenfalls den Unterordner enthalten
-use App\Filament\Resources\IngestSignals\IngestSignalResource\Pages;
 use App\Models\IngestSignal;
 use Filament\Resources\Resource;
 use Filament\Schemas\Schema;

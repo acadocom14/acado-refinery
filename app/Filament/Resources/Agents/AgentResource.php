@@ -2,203 +2,221 @@
 
 namespace App\Filament\Resources\Agents;
 
-use App\Filament\Resources\Agents\AgentResource\Pages;
 use App\Models\Agent;
+use App\Models\IngestSignal; // WICHTIG: Für die XP-Radar Logik
+use App\Filament\Resources\Agents\Pages;
+use App\Services\IngestPipeline;
 use Filament\Resources\Resource;
-use Filament\Schemas\Schema; // v4/2026 Standard laut deinem Error-Log
+
+// 1. DAS NEUE SCHEMA-SYSTEM (Container)
+use Filament\Schemas\Schema; 
+
+// 2. LAYOUT-KOMPONENTEN (Struktur - Wohnen in Schemas)
+use Filament\Schemas\Components\Section;
+
+// 3. EINGABE-FELDER & REPEATER (Datenverarbeitung - Wohnen in Forms)
+use Filament\Forms\Components\TextInput;
+use Filament\Forms\Components\FileUpload;
+use Filament\Forms\Components\Toggle;
+use Filament\Forms\Components\TagsInput;
+use Filament\Forms\Components\KeyValue;
+use Filament\Forms\Components\MarkdownEditor;
+use Filament\Forms\Components\Textarea;
+use Filament\Forms\Components\Select;
+use Filament\Forms\Components\Slider;
+use Filament\Forms\Components\Repeater;
+
+// 4. TABELLEN-IMPORTS
+use Filament\Tables;
 use Filament\Tables\Table;
-use BackedEnum;
+use Filament\Tables\Columns\TextColumn;
+use Filament\Tables\Columns\ImageColumn;
+use Filament\Tables\Columns\ToggleColumn;
 
 class AgentResource extends Resource
 {
     protected static ?string $model = Agent::class;
 
-    protected static string|BackedEnum|null $navigationIcon = 'heroicon-o-user-group';
-
+    // PHP 8.4 kompatible Typisierung (Reihenfolge ist wichtig!)
+    protected static \BackedEnum|string|null $navigationIcon = 'heroicon-o-user-group';
+    protected static \UnitEnum|string|null $navigationGroup = 'Scout Portal';
     protected static ?string $navigationLabel = 'Agents';
 
-public static function form(\Filament\Schemas\Schema $schema): \Filament\Schemas\Schema
-{
-    return $schema
-        ->components([
-            // Wir lassen alle "Section"-Klassen weg und packen die Felder direkt rein.
-            // Filament ordnet diese automatisch sauber untereinander an.
+    /**
+     * Die form-Methode nutzt das neue Schema-Objekt (Behalte die Sektionen)
+     */
+    public static function form(Schema $schema): Schema
+    {
+        return $schema
+            ->components([
+                // IDENTITY
+                Section::make('Executive Identity')
+                    ->columns(2)
+                    ->schema([
+                        FileUpload::make('avatar_url')
+                            ->label('Portrait Icon')
+                            ->image()
+                            ->avatar()
+                            ->disk('public')
+                            ->directory('agents')
+                            ->columnSpanFull(),
 
-            \Filament\Forms\Components\FileUpload::make('avatar_url')
-                ->label('Portrait Icon')
-                ->image()
-                ->avatar()
-                ->disk('public')
-                ->visibility('public')
-                ->directory('agents')
-                ->columnSpanFull(),
+                        TextInput::make('name')
+                            ->label('Full Name')
+                            ->required(),
 
-            \Filament\Forms\Components\TextInput::make('name')
-                ->label('Executive Name')
-                ->required(),
+                        TextInput::make('role_code')
+                            ->label('Role (Shorthand)')
+                            ->required(),
 
-            \Filament\Forms\Components\TextInput::make('role_code')
-                ->label('Role (Shorthand)')
-                ->required(),
+                        TextInput::make('acado_coins')
+                            ->label('Wallet (ACD)')
+                            ->numeric()
+                            ->default(0),
 
-            \Filament\Forms\Components\TextInput::make('acado_coins')
-                ->label('Wallet (ACD)')
-                ->numeric()
-                ->default(0),
+                        Toggle::make('is_active')
+                            ->label('Im Dienst (Aktiv)')
+                            ->default(true),
+                    ]),
 
-            \Filament\Forms\Components\Toggle::make('is_active')
-                ->label('Im Dienst (Aktiv)')
-                ->helperText('Wenn deaktiviert, wird dieser Agent in der Redaktion übersprungen.')
-                ->default(false)
-                ->columnSpanFull(),
+                // KI-GEHIRN (Mit dynamischem Modell-Select)
+                Section::make('KI-Konfiguration')
+                    ->description('Definition des LLM-Verhaltens')
+                    ->columns(2)
+                    ->schema([
+                        Select::make('soul_configuration.model')
+                            ->label('KI-Modell')
+                            ->options(fn (IngestPipeline $pipeline) => $pipeline->getAvailableModels())
+                            ->default('gemini-1.5-flash')
+                            ->searchable(),
 
-            // Wir nutzen das garantierte Standard-Feld für Tags
-            \Filament\Forms\Components\TagsInput::make('tags')
-                ->label('Abonnierte Themen (Tags)')
-                ->helperText('Bei welchen Buch-Themen soll dieser Agent aufwachen? (z.B. Marketing, SaaS, Finance)')
-                ->columnSpanFull(),
+                        Slider::make('soul_configuration.temperature')
+                            ->label('Kreativität')
+                            ->minValue(0.1) // v4 Methodik
+                            ->maxValue(1.0)
+                            ->step(0.1)
+                            ->default(0.2),
 
-\Filament\Forms\Components\KeyValue::make('experience_stats')
-                ->label('Level-System (XP-Radar)')
-                ->keyLabel('Fachgebiet (Tag)')
-                ->valueLabel('Bücher (Potenzial vs. XP)')
-                ->disabled() 
-                ->dehydrated(false) 
-                ->formatStateUsing(function ($state, $record) {
-                    // Wenn es ein neuer Agent ohne Tags ist
-                    if (!$record || empty($record->tags)) {
-                        return ['Keine Tags abonniert' => '0 in Bibliothek'];
-                    }
+                        MarkdownEditor::make('soul')
+                            ->label('Charakter-Definition (Soul)')
+                            ->columnSpanFull(),
 
-                    $stats = [];
-                    // $state sind die WIRKLICH gelesenen Bücher (aus der Datenbank)
-                    $readStats = is_array($state) ? $state : [];
+                        Textarea::make('system_prompt')
+                            ->label('Extraktions-Anweisung')
+                            ->rows(3)
+                            ->columnSpanFull(),
+                    ]),
 
-                    // Alle Bücher laden (für kleine bis mittlere Datenbanken absolut okay)
-                    $allBooks = \App\Models\IngestSignal::all();
+                // EXPERTISE (Mit XP-Radar Logik)
+                Section::make('Expertise & Stats')
+                    ->schema([
+                        TagsInput::make('tags')
+                            ->label('Abonnierte Themen')
+                            ->columnSpanFull(),
 
-                    foreach ($record->tags as $tag) {
-                        // Zähle, wie viele Bücher diesen spezifischen Tag (oder "all" / "*") haben
-                        $matchingBooks = $allBooks->filter(function($book) use ($tag) {
-                            if (!is_array($book->tags)) return false;
-                            // Matcht exakten Tag oder Wildcards
-                            return in_array($tag, $book->tags) || in_array('*', $book->tags) || in_array('all', $book->tags);
-                        })->count();
-
-                        $readCount = $readStats[$tag] ?? 0;
-                        
-                        // Das Format für die Anzeige: "3 in Bibliothek | 0 gelesen"
-                        $stats[$tag] = "{$matchingBooks} in Bibliothek | {$readCount} gelesen";
-                    }
-
-                    return $stats;
-                })
-                ->columnSpanFull(),
-
-            \Filament\Forms\Components\MarkdownEditor::make('soul')
-                ->label('Charakter-Definition (soul.md)')
-                ->placeholder('Du bist Jackson, ein analytischer ROI-Optimierer...')
-                ->columnSpanFull(),
-
-            \Filament\Forms\Components\Textarea::make('system_prompt')
-                ->label('Extraktions-Prompt')
-                ->placeholder('Worauf soll der Agent beim Lesen besonders achten?')
-                ->rows(4)
-                ->columnSpanFull(),
-
-            \Filament\Forms\Components\Repeater::make('perspectives')
-                ->label('Inhaltliche Perspektiven (Die 4 Hooks)')
-                ->schema([
-                    \Filament\Forms\Components\TextInput::make('angle')
-                        ->label('Analyse-Winkel')
-                        ->placeholder('z.B. ROI-Potenzial'),
-                ])
-                ->maxItems(4)
-                ->grid(2)
-                ->columnSpanFull(),
-        ]);
-}
-public static function table(\Filament\Tables\Table $table): \Filament\Tables\Table
-{
-    return $table
-        ->columns([
-            
-            // 3. Urlaubsschalter
-            \Filament\Tables\Columns\ToggleColumn::make('is_active')
-                ->label('Im Dienst'),
-
-            // 1. Avatar mit Graustufen-Logik
-            \Filament\Tables\Columns\ImageColumn::make('avatar_url')
-                ->label('')
-                ->disk('public')
-                ->circular()
-                ->extraImgAttributes(fn ($record): array => [
-                    'style' => $record->is_active 
-                        ? 'filter: drop-shadow(0 0 5px rgba(34, 197, 94, 0.4));' 
-                        : 'filter: grayscale(100%); opacity: 0.3;',
-                ]),
-
-            // 2. Name als Link zur Bearbeitung (Dein bewährter Retter)
-            \Filament\Tables\Columns\TextColumn::make('name')
-                ->label('Executive Name')
-                ->weight('bold')
-                ->searchable()
-                ->url(fn (\App\Models\Agent $record): string => Pages\EditAgent::getUrl(['record' => $record])),
-
-            \Filament\Tables\Columns\TextColumn::make('role_code')
-                ->label('Role')
-                ->wrap(),
-
-
-            // --- NEU: 1. Die Tags als schicke Badges ---
-        \Filament\Tables\Columns\TextColumn::make('tags')
-                ->label('Expertise')
-                ->badge()
-                ->color('info')
-                ->searchable()
-                ->wrap() // <--- NEU: Erlaubt Zeilenumbruch für die Badges
-                ->extraAttributes(['style' => 'max-width: 300px;']), // Begrenzt die maximale Breite
-
-            // --- NEU: 2. Der XP-Score ---
-            \Filament\Tables\Columns\TextColumn::make('xp_score')
-                ->label('XP (Read / Match / Total)')
-                ->getStateUsing(function (\App\Models\Agent $record) {
-                    // 1. Gesamtanzahl aller Bücher im System
-                    $totalBooks = \App\Models\IngestSignal::count();
-                    
-                    // 2. Gelesene Bücher (Summe aus dem experience_stats Array)
-                    $readBooks = is_array($record->experience_stats) ? array_sum($record->experience_stats) : 0;
-                    
-                    // 3. Passende Bücher in der Bibliothek
-                    $matchingBooks = 0;
-                    if (!empty($record->tags)) {
-                        $allBooks = \App\Models\IngestSignal::all();
-                        $matchingBooks = $allBooks->filter(function($book) use ($record) {
-                            if (!is_array($book->tags)) return false;
-                            foreach ($record->tags as $tag) {
-                                if (in_array($tag, $book->tags) || in_array('*', $book->tags) || in_array('all', $book->tags)) {
-                                    return true;
+                        KeyValue::make('experience_stats')
+                            ->label('XP-Radar')
+                            ->disabled()
+                            ->dehydrated(false)
+                            ->formatStateUsing(function ($state, $record) {
+                                if (!$record || empty($record->tags)) {
+                                    return ['Status' => 'Keine Expertise definiert'];
                                 }
-                            }
-                            return false;
-                        })->count();
-                    }
-                    
-                    // Formatiert die Zahlen immer zweistellig: "05 / 12 / 45"
-                    return sprintf('%02d / %02d / %02d', $readBooks, $matchingBooks, $totalBooks);
-                })
-                ->badge()
-                ->color('success'),
+                                $stats = [];
+                                $allBooks = IngestSignal::all();
+                                foreach ($record->tags as $tag) {
+                                    $match = $allBooks->filter(fn($b) => is_array($b->tags) && in_array($tag, $b->tags))->count();
+                                    $read = ($state[$tag] ?? 0);
+                                    $stats[$tag] = "{$match} in Lib | {$read} gelesen";
+                                }
+                                return $stats;
+                            })
+                            ->columnSpanFull(),
+                    ]),
 
-            \Filament\Tables\Columns\ToggleColumn::make('is_active')
-                ->label('Im Dienst'),
+                // DIE 4 HOOKS (In einer eigenen Sektion für UI Stabilität)
+                Section::make('Inhaltliche Perspektiven')
+                    ->schema([
+                        Repeater::make('perspectives')
+                            ->label('Fokus-Themen') // Hauptlabel für die ganze Gruppe
+                            ->schema([
+                                TextInput::make('angle')
+                            ->placeholder('z.B. CAC:LTV & Growth Engines')
+                            ->hiddenLabel() // Entfernt das "Winkel" über jedem einzelnen Feld
+                            ->required(),
+                        ])
+                            ->maxItems(4)
+                            ->grid(2)
+                            ->columnSpanFull(),
+                    ]),
+            ]);
+    }
 
-        ])
-        // Wir lassen die Actions erst mal leer, um den Class-Error zu vermeiden
-        // Du kannst Agenten ja über den Klick auf den Namen bearbeiten!
-        ->actions([])
-        ->bulkActions([]);
-}
+    /**
+     * HIER IST DIE VERBESSERTE TABELLEN-ANSICHT (Rückgerollt & Fixiert)
+     */
+    public static function table(Table $table): Table
+    {
+        return $table
+            ->columns([
+                // 1. Avatar mit Graustufen-Logik
+                ImageColumn::make('avatar_url')
+                    ->label('')
+                    ->disk('public')
+                    ->circular()
+                    ->extraImgAttributes(fn ($record): array => [
+                        'style' => $record->is_active 
+                            ? 'filter: drop-shadow(0 0 5px rgba(34, 197, 94, 0.4));' 
+                            : 'filter: grayscale(100%); opacity: 0.3;',
+                    ]),
+
+                // 2. Name als Link zur Bearbeitung
+                TextColumn::make('name')
+                    ->label('Executive Name')
+                    ->weight('bold')
+                    ->searchable()
+                    ->url(fn (Agent $record): string => Pages\EditAgent::getUrl(['record' => $record])),
+
+                // 3. Rolle als Badge
+                TextColumn::make('role_code')
+                    ->label('Role')
+                    ->badge(),
+
+                // 4. Tags als Expertise-Badges
+                TextColumn::make('tags')
+                    ->label('Expertise')
+                    ->badge()
+                    ->color('info')
+                    ->searchable()
+                    ->wrap(),
+
+                // 5. XP-Score Status-Badge (Read / Match / Total)
+                TextColumn::make('xp_score')
+                    ->label('XP (Read/Match/Total)')
+                    ->getStateUsing(function (Agent $record) {
+                        $totalBooks = IngestSignal::count();
+                        $readBooks = is_array($record->experience_stats) ? array_sum($record->experience_stats) : 0;
+                        $matchingBooks = 0;
+                        if (!empty($record->tags)) {
+                            $allBooks = IngestSignal::all();
+                            $matchingBooks = $allBooks->filter(function($book) use ($record) {
+                                if (!is_array($book->tags)) return false;
+                                // Matcht exakten Tag oder Wildcards
+                                return count(array_intersect($record->tags, $book->tags)) > 0 || in_array('*', $book->tags);
+                            })->count();
+                        }
+                        return sprintf('%02d / %02d / %02d', $readBooks, $matchingBooks, $totalBooks);
+                    })
+                    ->badge()
+                    ->color('success'),
+
+                // 6. Urlaubsschalter (Status)
+                ToggleColumn::make('is_active')
+                    ->label('Im Dienst'),
+            ])
+            ->actions([])
+            ->bulkActions([]);
+    }
 
     public static function getPages(): array
     {
