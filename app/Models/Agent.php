@@ -2,24 +2,31 @@
 
 namespace App\Models;
 
-use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
 
 class Agent extends Model
 {
     use HasFactory;
 
-    /**
-     * Die Attribute, die massenweise zugewiesen werden dürfen.
-     * Hier fügen wir alles hinzu, was wir im Filament-Formular nutzen.
-     */
     protected $fillable = [
         'name',
-        'role_code',    // Wichtig für den Rollen-Shorthand
-        'avatar_url',   // Der Übeltäter für deinen aktuellen Fehler
-        'acado_coins',  // Damit das Wallet gespeichert werden kann
-        'system_prompt', 
+        'role_code',
+        'avatar_url',
+        'acado_coins',
+        'system_prompt',
         'bio',
-        'soul_path',
+        'soul',
+        'perspectives',
+        'is_active',
+        'tags',
+        'experience_stats', // <--- NEU
+    ];
+
+    protected $casts = [
+        'perspectives' => 'array',
+        'is_active' => 'boolean',
+        'tags' => 'array',
+        'experience_stats' => 'array', // <--- NEU: Macht es zu einem nutzbaren Array
     ];
 }

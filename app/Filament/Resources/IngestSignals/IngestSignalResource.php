@@ -27,10 +27,18 @@ class IngestSignalResource extends Resource
         return $schema
             ->components([
                 // Keine Sections mehr - direkte Übergabe der Felder!
+                // 1. Das Eingabefeld für den Titel
                 \Filament\Forms\Components\TextInput::make('title')
                     ->label('Asset Name / Deal Title')
                     ->required()
-                    ->columnSpanFull(),
+                    ->columnSpanFull(), // <--- Hier fehlte vorhin das Komma!
+
+                // 2. Das Eingabefeld für die Tags (Forms\Components, NICHT Tables\Columns!)
+   
+                \Filament\Forms\Components\TagsInput::make('tags')
+                ->label('Themen-Tags (Routing)')
+                ->helperText('Welche Themen behandelt dieses Buch? (z.B. Marketing, SaaS, Finance). Nur Agenten mit den passenden Tags werden dieses Buch analysieren.')
+                ->columnSpanFull(),
 
                 \Filament\Forms\Components\Select::make('status')
                     ->options([
@@ -42,6 +50,7 @@ class IngestSignalResource extends Resource
                     ])
                     ->default('draft')
                     ->required(),
+
 
                 \Filament\Forms\Components\SpatieMediaLibraryFileUpload::make('documents')
                     ->collection('scouts')
@@ -71,6 +80,15 @@ class IngestSignalResource extends Resource
                     ->weight('bold')
                     ->searchable()
                     ->url(fn (IngestSignal $record): string => Pages\EditIngestSignal::getUrl(['record' => $record])),
+
+                    // 2. Anzeige der Tags als blaue Badges
+                \Filament\Tables\Columns\TextColumn::make('tags')
+                    ->label('Routing-Tags')
+                    ->badge()
+                    ->color('info')
+                    ->searchable()
+                    ->wrap() // Erlaubt Zeilenumbruch, damit die Spalte nicht zu breit wird
+                    ->extraAttributes(['style' => 'max-width: 300px;']),
 
                 \Filament\Tables\Columns\BadgeColumn::make('status')
                     ->colors([
