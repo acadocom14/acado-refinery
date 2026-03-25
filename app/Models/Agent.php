@@ -17,16 +17,18 @@ class Agent extends Model
         'system_prompt',
         'bio',
         'soul',
+        'soul_configuration', // <--- MUSS HIER REIN
         'perspectives',
         'is_active',
         'tags',
-        'experience_stats', // <--- NEU
+        'experience_stats',
     ];
 
     protected $casts = [
+        'soul_configuration' => 'array', // <--- DAS IST DER ENTSCHEIDENDE FIX
         'perspectives' => 'array',
         'is_active' => 'boolean',
         'tags' => 'array',
-        'experience_stats' => 'array', // <--- NEU: Macht es zu einem nutzbaren Array
+        'experience_stats' => 'array',
     ];
 }

@@ -1,72 +1,61 @@
 <?php
 
-// HIER IST DER MAGISCHE FIX: Der exakte Ordnerpfad!
-namespace App\Filament\Resources\IngestSignals; // Muss exakt so sein
+namespace App\Filament\Resources\IngestSignals;
 
 use App\Models\IngestSignal;
 use Filament\Resources\Resource;
-use Filament\Schemas\Schema;
+use Filament\Schemas\Schema; 
 use Filament\Tables\Table;
+use App\Filament\Resources\IngestSignals\Pages;
 
 class IngestSignalResource extends Resource
 {
     protected static ?string $model = IngestSignal::class;
 
-    // PHP 8.4 Strenge Typisierung für das Icon
-    protected static string|\BackedEnum|null $navigationIcon = 'heroicon-o-document-magnifying-glass';
-
-    // PHP 8.4 Strenge Typisierung für die Gruppe
-    protected static string|\UnitEnum|null $navigationGroup = 'Scout Portal';
-
-    protected static ?string $navigationLabel = 'Ingest Signals';
+    protected static string | \BackedEnum | null $navigationIcon = 'heroicon-o-document-magnifying-glass';
+    protected static string | \UnitEnum | null $navigationGroup = 'Scout Portal';
 
     public static function form(Schema $schema): Schema
     {
-        return $schema
-            ->components([
-                // Keine Sections mehr - direkte Übergabe der Felder!
-                // 1. Das Eingabefeld für den Titel
-                \Filament\Forms\Components\TextInput::make('title')
-                    ->label('Asset Name / Deal Title')
-                    ->required()
-                    ->columnSpanFull(), // <--- Hier fehlte vorhin das Komma!
+        return $schema->components([
+            \Filament\Forms\Components\TextInput::make('title')->label('Deal / Asset')->required()->columnSpanFull(),
+            \Filament\Forms\Components\TagsInput::make('tags')->label('Themen-Tags')->columnSpanFull(),
+            
+            \Filament\Forms\Components\Select::make('status')
+                ->options([
+                    'draft' => 'Entwurf',
+                    'processing' => 'Analyse läuft',
+                    'cancelled' => 'Abgebrochen',
+                    'done' => 'Board Ready',
+                ])->default('draft'),
 
-                // 2. Das Eingabefeld für die Tags (Forms\Components, NICHT Tables\Columns!)
-   
-                \Filament\Forms\Components\TagsInput::make('tags')
-                ->label('Themen-Tags (Routing)')
-                ->helperText('Welche Themen behandelt dieses Buch? (z.B. Marketing, SaaS, Finance). Nur Agenten mit den passenden Tags werden dieses Buch analysieren.')
-                ->columnSpanFull(),
+            \Filament\Forms\Components\SpatieMediaLibraryFileUpload::make('documents')->collection('scouts')->multiple()->columnSpanFull(),
 
-                \Filament\Forms\Components\Select::make('status')
-                    ->options([
-                        'draft' => 'Draft (Unprocessed)',
-                        'queued' => 'Queued for Batch Processing',
-                        'routing' => 'Phase 1: Chapter Routing',
-                        'extracting' => 'Phase 2: 4-Vector Extraction',
-                        'trading_floor_ready' => 'Phase 3: Trading Floor Ready',
-                    ])
-                    ->default('draft')
-                    ->required(),
+            // --- HIER IST DEIN TELNET FENSTER WIEDER ---
+            \Filament\Schemas\Components\Tabs::make('Details')
+                ->tabs([
+                    \Filament\Schemas\Components\Tabs\Tab::make('Master Blob (Protokoll)')
+                        ->icon('heroicon-o-clipboard-document-check')
+                        ->schema([
+                            \Filament\Forms\Components\MarkdownEditor::make('master_blob_draft')
+                                ->label('Zusammenfassung')
+                                ->nullable() 
+                                ->dehydrated(true) 
+                                ->columnSpanFull(),
+                        ]),
 
-
-                \Filament\Forms\Components\SpatieMediaLibraryFileUpload::make('documents')
-                    ->collection('scouts')
-                    ->label('M&A Documents (PDFs)')
-                    ->multiple()
-                    ->maxSize(102400) // 100MB in KB
-                    ->acceptedFileTypes(['application/pdf'])
-                    ->multiple()
-                    ->reorderable()
-                    ->disk('public')
-                    ->visibility('public')
-                    ->columnSpanFull(),
-
-                \Filament\Forms\Components\Textarea::make('raw_content')
-                    ->label('Master Blob Draft (JSON / Excerpts)')
-                    ->rows(15)
-                    ->columnSpanFull(),
-            ]);
+                    \Filament\Schemas\Components\Tabs\Tab::make('Live Log (Telnet)')
+                        ->icon('heroicon-o-command-line')
+                        ->schema([
+                            \Filament\Forms\Components\Placeholder::make('processing_logs')
+                                ->label('Ereignis-Stream')
+                                ->content(fn ($record) => $record 
+                                    ? view('filament.components.telnet-log', ['record' => $record]) 
+                                    : 'Standby...'
+                                ),
+                        ]),
+                ])->columnSpanFull(),
+        ]);
     }
 
     public static function table(Table $table): Table
@@ -74,35 +63,16 @@ class IngestSignalResource extends Resource
         return $table
             ->columns([
                 \Filament\Tables\Columns\TextColumn::make('title')
-                    ->label('Deal Title (Click to Edit)')
+                    ->searchable()
+                    ->sortable()
                     ->weight('bold')
-                    ->searchable()
-                    ->url(fn (IngestSignal $record): string => Pages\EditIngestSignal::getUrl(['record' => $record])),
-
-                    // 2. Anzeige der Tags als blaue Badges
-                \Filament\Tables\Columns\TextColumn::make('tags')
-                    ->label('Routing-Tags')
-                    ->badge()
-                    ->color('info')
-                    ->searchable()
-                    ->wrap() // Erlaubt Zeilenumbruch, damit die Spalte nicht zu breit wird
-                    ->extraAttributes(['style' => 'max-width: 300px;']),
-
-                \Filament\Tables\Columns\BadgeColumn::make('status')
-                    ->colors([
-                        'danger' => 'draft',
-                        'warning' => 'routing',
-                        'primary' => 'extracting',
-                        'success' => 'trading_floor_ready',
-                    ]),
-
-                \Filament\Tables\Columns\TextColumn::make('created_at')
-                    ->label('Ingest Date')
-                    ->dateTime('M d, Y')
-                    ->sortable(),
+                    // Klickbarer Titel, um die kaputten EditActions zu umgehen
+                    ->url(fn (IngestSignal $record): string => static::getUrl('edit', ['record' => $record]))
+                    ->color('primary'),
+                \Filament\Tables\Columns\TextColumn::make('status')->badge(),
+                \Filament\Tables\Columns\TextColumn::make('created_at')->dateTime()->label('Datum'),
             ])
-            ->actions([])
-            ->bulkActions([]);
+            ->actions([]); // Leer lassen, damit Filament hier nicht abstürzt
     }
 
     public static function getPages(): array

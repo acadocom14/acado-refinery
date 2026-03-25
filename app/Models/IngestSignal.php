@@ -11,16 +11,20 @@ class IngestSignal extends Model implements HasMedia
 {
     use HasFactory, InteractsWithMedia;
 
-protected $fillable = [
+    protected $fillable = [
         'title',
         'file_path',
         'status',
-        'author',            // Falls du das schon drin hast
-        'original_filename', // Falls du das schon drin hast
-        'tags',              // <--- NEU
+        'author',            
+        'original_filename', 
+        'tags',              
+        'raw_content',       // <--- WICHTIG: Für den extrahierten Text
+        'processing_logs',   // <--- WICHTIG: Erlaubt das Speichern der Logs
+        'master_blob_draft', // <--- WICHTIG: Erlaubt das Speichern des finalen Ergebnisses
     ];
 
     protected $casts = [
-        'tags' => 'array',   // <--- NEU: Macht aus dem JSON eine nutzbare Liste
+        'tags' => 'array',   
+        'processing_logs' => 'array', // <--- DER FIX: Macht den String zum Array!
     ];
 }
