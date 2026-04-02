@@ -21,6 +21,7 @@ class IngestSignal extends Model implements HasMedia
         'raw_content',       // <--- WICHTIG: Für den extrahierten Text
         'processing_logs',   // <--- WICHTIG: Erlaubt das Speichern der Logs
         'master_blob_draft', // <--- WICHTIG: Erlaubt das Speichern des finalen Ergebnisses
+        'category',
     ];
 
     protected $casts = [
