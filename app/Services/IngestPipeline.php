@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\Agent;
+use App\Models\Asset;
 use App\Models\IngestSignal;
 use App\Settings\LlmSettings;
 use Illuminate\Support\Facades\Http;
@@ -10,12 +11,41 @@ use Illuminate\Support\Facades\Cache;
 use Smalot\PdfParser\Parser;
 use Illuminate\Support\Str;
 
-/**
- * IngestPipeline handles the multi-step processing of documents
- * using local extraction and LLM-based analysis.
- */
 class IngestPipeline
 {
+    /**
+     * Zentrales Logging für Terminal (Log-File) und Dashboard (DB).
+     */
+    protected function log($target, string $message, string $type = 'info')
+    {
+        $timestamp = now()->format('H:i:s');
+        $prefix = match($type) {
+            'info'    => " [SYSTEM] ",
+            'warning' => "![ACTION] ",
+            'done'    => ">>[OK]    ",
+            'error'   => "##[ERROR] ",
+            default   => " [LOG]    ",
+        };
+
+        // 1. Immer ins Laravel-System-Log für PowerShell tail/Get-Content
+        \Log::info("{$timestamp}{$prefix}{$message}");
+
+        // 2. In die Datenbank für das Refinery-Terminal (Live-Poll)
+        if ($target instanceof Asset) {
+            $logs = $target->processing_logs;
+            if (!is_array($logs)) {
+                $logs = [];
+            }
+            $logs[] = ['t' => $timestamp, 'm' => $message, 'type' => $type];
+            $target->update(['processing_logs' => array_slice($logs, -100)]);
+        } 
+        elseif ($target instanceof IngestSignal && $target->exists) {
+            $logs = $target->processing_logs ?? [];
+            $logs[] = ['t' => $timestamp, 'm' => $message, 'type' => $type];
+            $target->update(['processing_logs' => $logs]);
+        }
+    }
+
     /**
      * Resolves the appropriate model for the current task.
      */
@@ -24,7 +54,6 @@ class IngestPipeline
         $settings = app(LlmSettings::class);
         $agentModel = data_get($agent, 'soul_configuration.model');
         
-        // Priority: Agent-specific model > Global settings > Fallback
         if ($step === 'analysis' && !empty($agentModel)) return $agentModel;
 
         $stepMap = [
@@ -36,24 +65,15 @@ class IngestPipeline
         return !empty($stepMap[$step]) ? $stepMap[$step] : $this->getIntelligentFallback();
     }
 
-    /**
-     * Provides a smart fallback model based on availability and capability.
-     */
     protected function getIntelligentFallback(): string
     {
         $models = $this->getAvailableModels();
         $availableKeys = collect($models)->keys();
-        
-        // Priority: Latest generation > Lite version > Legacy Flash
         if ($availableKeys->contains('gemini-3.1-flash-lite')) return 'gemini-3.1-flash-lite';
         if ($availableKeys->contains('gemini-3-flash')) return 'gemini-3-flash';
-
         return 'gemini-2.5-flash';
     }
 
-    /**
-     * Fetches available models from the Google AI Gateway.
-     */
     public function getAvailableModels(): array
     {
         return Cache::remember('gemini_models_v2026', 3600, function () {
@@ -68,27 +88,12 @@ class IngestPipeline
         });
     }
 
-    /**
-     * Logs processing steps into the database for real-time streaming.
-     */
-    protected function log(IngestSignal $signal, string $message, string $type = 'info')
-    {
-        $logs = $signal->processing_logs;
-        if (!is_array($logs)) $logs = [];
-        $logs[] = ['t' => now()->format('H:i:s'), 'm' => $message, 'type' => $type];
-        $signal->processing_logs = $logs;
-        $signal->save();
-    }
-
-    /**
-     * Central LLM gateway with built-in rate limit handling.
-     */
-    public function ask(string $step, ?Agent $agent, string $content, IngestSignal $signal, int $maxRetries = 3)
+    public function ask(string $step, ?Agent $agent, string $content, $logTarget, int $maxRetries = 3)
     {
         $model = $this->resolveModel($step, $agent);
         $model = str_replace('models/', '', $model);
         
-        $this->log($signal, "📤 [PROMPT] ({$model}): " . Str::limit($content, 250), 'warning');
+        $this->log($logTarget, "📤 [PROMPT] ({$model}): " . Str::limit($content, 250), 'warning');
 
         $apiKey = config('services.gemini.key');
         if (!$apiKey) return null;
@@ -106,22 +111,21 @@ class IngestPipeline
 
                 if ($response->successful()) {
                     $resText = data_get($response->json(), 'candidates.0.content.parts.0.text');
-                    $this->log($signal, "📥 [RESPONSE]: " . Str::limit(trim($resText), 150), 'done');
+                    $this->log($logTarget, "📥 [RESPONSE]: " . Str::limit(trim($resText), 150), 'done');
                     return $resText;
                 } 
                 
-                // 429 Rate Limit - Wait for quota reset
                 if ($response->status() === 429) {
-                    $this->log($signal, "⏳ [QUOTA EXCEEDED] Pausing for 60s...", 'warning');
+                    $this->log($logTarget, "⏳ [QUOTA EXCEEDED] Pausing for 60s...", 'warning');
                     sleep(60); 
                     continue; 
                 }
 
-                $this->log($signal, "⛔ [API ERROR] HTTP " . $response->status(), 'error');
+                $this->log($logTarget, "⛔ [API ERROR] HTTP " . $response->status(), 'error');
                 $attempt++;
                 sleep(5 * $attempt);
             } catch (\Exception $e) {
-                $this->log($signal, "💥 [FATAL CRASH]: " . $e->getMessage(), 'error');
+                $this->log($logTarget, "💥 [FATAL CRASH]: " . $e->getMessage(), 'error');
                 $attempt++;
                 sleep(5);
             }
@@ -129,20 +133,14 @@ class IngestPipeline
         return null;
     }
 
-    /**
-     * Central LLM gateway for Structured Output (JSON).
-     */
-    public function askStructured(string $step, ?Agent $agent, string $content, array $jsonSchema, IngestSignal $signal, int $maxRetries = 3)
+    public function askStructured(string $step, ?Agent $agent, string $content, array $jsonSchema, $logTarget, int $maxRetries = 3)
     {
         $model = $this->resolveModel($step, $agent);
         $model = str_replace('models/', '', $model);
-
         $apiKey = config('services.gemini.key');
         if (!$apiKey) return null;
 
         $url = "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}";
-        
-        // Bei JSON-Extraktion wollen wir extrem deterministische Antworten (Temperature nahe 0)
         $temp = 0.1; 
 
         $attempt = 0;
@@ -162,16 +160,16 @@ class IngestPipeline
                 } 
                 
                 if ($response->status() === 429) {
-                    $this->log($signal, "⏳ [QUOTA EXCEEDED] Pausing for 60s...", 'warning');
+                    $this->log($logTarget, "⏳ [QUOTA EXCEEDED] Pausing for 60s...", 'warning');
                     sleep(60); 
                     continue; 
                 }
 
-                $this->log($signal, "⛔ [API ERROR] HTTP " . $response->status(), 'error');
+                $this->log($logTarget, "⛔ [API ERROR] HTTP " . $response->status(), 'error');
                 $attempt++;
                 sleep(5 * $attempt);
             } catch (\Exception $e) {
-                $this->log($signal, "💥 [FATAL CRASH]: " . $e->getMessage(), 'error');
+                $this->log($logTarget, "💥 [FATAL CRASH]: " . $e->getMessage(), 'error');
                 $attempt++;
                 sleep(5);
             }
@@ -180,233 +178,180 @@ class IngestPipeline
     }
 
     /**
-     * Extracts text using local OS tools or PHP fallbacks.
+     * DER HAUPTMOTOR FÜR DIE ASSET-FABRIK (Queue Ready)
      */
-    protected function extractPdfLocally(string $path, IngestSignal $signal): string
+    public function processAssetPipeline(Asset $asset)
     {
-        $this->log($signal, "⚙️ EXTRACTION: Initializing pdftotext...", 'info');
-        $output = [];
-        $returnVar = -1;
+        $separator = str_repeat("=", 60);
+        $this->log($asset, $separator);
+        $this->log($asset, "INITIALIZING ACADO ASSET REFINERY v2.5", 'info');
+        $this->log($asset, "TARGET ASSET: " . strtoupper($asset->name), 'info');
+        $this->log($asset, $separator);
+
+        $asset->update(['status' => 'processing']);
+        $stages = $asset->pipelineStages()->orderBy('stage_level', 'asc')->get();
         
-        $cmd = "pdftotext -layout " . escapeshellarg($path) . " -";
-        exec($cmd, $output, $returnVar);
-
-        $text = "";
-        if ($returnVar === 0 && count($output) > 0) {
-            $text = implode("\n", $output);
+        if ($stages->isEmpty()) {
+            $this->log($asset, "CRITICAL: NO PIPELINE STAGES DEFINED", 'error');
+            return $asset->update(['status' => 'failed']);
         }
 
-        if (empty($text)) {
-            $this->log($signal, "🩹 FALLBACK: Using Smalot PHP Parser...", 'warning');
-            try {
-                $parser = new Parser();
-                $pdf = $parser->parseFile($path);
-                $text = $pdf->getText();
-            } catch (\Throwable $t) {
-                $this->log($signal, "❌ EXTRACTION FAILED: " . $t->getMessage(), 'error');
+        $allSignals = $asset->ingestSignals ?? collect();
+        $chainedOutput = ""; 
+
+        foreach ($stages as $stage) {
+            $this->log($asset, "--- LOADING STAGE {$stage->stage_level}: " . strtoupper($stage->name) . " ---", 'info');
+            
+            $activeAgent = $stage->agents->first();
+            if ($activeAgent) {
+                $this->log($asset, "DEPLOYING AGENT: {$activeAgent->name}", 'warning');
             }
+
+            $externalContext = match($stage->signal_filter) {
+                'fach'     => $allSignals->where('type', 'fach')->pluck('master_blob_draft')->filter()->implode("\n\n---\n\n"),
+                'business' => $allSignals->where('type', 'business')->pluck('master_blob_draft')->filter()->implode("\n\n---\n\n"),
+                'poesie'   => $allSignals->where('type', 'poesie')->pluck('master_blob_draft')->filter()->implode("\n\n---\n\n"),
+                'all'      => $allSignals->pluck('master_blob_draft')->filter()->implode("\n\n---\n\n"),
+                default    => "",
+            };
+
+            if (empty($externalContext) && $stage->signal_filter !== 'previous_only') {
+                $externalContext = "RESERVE_DATA: " . ($asset->description ?? $asset->name);
+                $this->log($asset, "Utilizing Asset Fallback Data.", 'info');
+            }
+
+            $stageInput = "--- EXTERNAL DATA ---\n{$externalContext}\n\n--- PREVIOUS OUTPUT ---\n{$chainedOutput}";
+            $chunks = $this->splitIntoChunks($stageInput);
+            $responses = [];
+
+            foreach ($chunks as $idx => $chunk) {
+                $this->log($asset, "Processing Chunk " . ($idx+1) . "/" . count($chunks) . "...", 'info');
+                $prompt = "{$stage->fixed_prompt_template}\n\nDIRECTIVE: {$stage->custom_prompt_directive}\n\nCONTEXT:\n{$chunk}";
+                
+                $res = $this->ask('analysis', $activeAgent, $prompt, $asset);
+                if ($res) $responses[] = $res;
+                
+                $this->log($asset, "Enforcing 4s API cool-down...", 'info');
+                sleep(4); 
+            }
+
+            $isJson = Str::contains(strtolower($stage->fixed_prompt_template), 'json');
+            $chainedOutput = $isJson ? "[\n".implode(",\n", $responses)."\n]" : implode("\n\n", $responses);
+            
+            // Speichere Stage-Output für Archiv
+            // Suche diese Stelle:
+            $allOutputs = $asset->pipeline_outputs ?? []; // Sicherstellen, dass es ein Array ist
+            $allOutputs["stage_{$stage->stage_level}"] = [
+                'name' => $stage->name, 
+                'content' => $chainedOutput
+            ];
+            $asset->update(['pipeline_outputs' => $allOutputs]);
+
+            $this->log($asset, "STAGE {$stage->stage_level} COMPLETED.", 'done');
+            $this->log($asset, str_repeat("-", 40));
         }
 
-        // Clean output for JSON compatibility (UTF-8 Sanitization)
-        if (!empty($text)) {
-            $text = mb_convert_encoding($text, 'UTF-8', 'UTF-8');
-            $text = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/u', '', $text);
-            return trim($text);
-        }
+        $this->log($asset, "ALL STAGES PROCESSED. COMPILING FINAL MANIFEST...", 'done');
+        $this->log($asset, $separator);
+        
+        // Finales Dokument aus Stage 4 (Compliance) und Stage 5 (Poesie)
+        $final = ($asset->pipeline_outputs['stage_4']['content'] ?? '') . "\n\n" . ($asset->pipeline_outputs['stage_5']['content'] ?? '');
+        $asset->update(['status' => 'active', 'final_content' => $final]);
+    }
 
-        return "";
+    protected function splitIntoChunks(string $text, int $maxChars = 25000): array
+    {
+        if (empty(trim($text))) return [];
+        $chunks = explode("|||", wordwrap($text, $maxChars, "|||"));
+        return array_filter(array_map('trim', $chunks));
     }
 
     /**
-     * Entry point for the boardroom workflow.
+     * ALTE INGEST-LOGIK (BOARDROOM)
      */
     public function processWithRouting(IngestSignal $signal)
     {
         $this->log($signal, "🚀 BOARDROOM: Initializing process...", 'info');
         $signal->update(['status' => 'processing', 'processing_logs' => []]);
 
-        // 1. DATA EXTRACTION
         if (empty($signal->raw_content) || str_contains($signal->raw_content, '%PDF')) {
             $allText = "";
             $media = $signal->getMedia('scouts');
-
             foreach ($media as $file) {
-                $this->log($signal, "📄 Processing: " . $file->file_name, 'info');
                 $extracted = $this->extractPdfLocally($file->getPath(), $signal);
                 if (!empty($extracted)) $allText .= $extracted . "\n\n";
             }
-            
             $signal->raw_content = trim($allText);
             if (empty($signal->raw_content)) {
-                $this->log($signal, "🛑 ABORT: No readable content found.", 'error');
-                $signal->update(['status' => 'cancelled']);
-                return;
+                $this->log($signal, "🛑 ABORT: No content found.", 'error');
+                return $signal->update(['status' => 'cancelled']);
             }
             $signal->save();
         }
 
-        // 2. SMART CHUNKING
-        $this->log($signal, "🧠 STRUCTURE: Segmenting content by chapter...", 'info');
-        $chapters = [];
         $chunks = preg_split('/(?=^\s*(?:Chapter|Kapitel)\s*\d+)/mi', $signal->raw_content);
-
-        if (count($chunks) > 1) { 
-            foreach ($chunks as $chunk) {
-                if (strlen(trim($chunk)) < 150) continue; 
-                $lines = array_filter(explode("\n", trim($chunk)));
-                $title = Str::limit(preg_replace('/[^A-Za-z0-9\s]/', '', reset($lines)), 60);
-                $chapters[] = ['title' => $title, 'content' => trim($chunk)];
-            }
-            $this->log($signal, "✅ Success: " . count($chapters) . " chapters identified.", 'done');
-        } 
-        
-        // MODIFICATION 1: Smart Chunking Fallback (If 3 or fewer chapters found)
-        if (count($chapters) <= 3) {
-            $this->log($signal, "⚠️ Too few markers found. Forcing fixed 15k-wordwrap split.", 'warning');
-            $chapters = []; // Reset array
+        $chapters = [];
+        if (count($chunks) <= 3) {
             $rawChunks = explode("|||", wordwrap($signal->raw_content, 15000, "|||"));
-            foreach($rawChunks as $i => $c) {
-                $chapters[] = ['title' => "Section " . ($i+1), 'content' => trim($c)];
+            foreach($rawChunks as $i => $c) { $chapters[] = ['title' => "Section " . ($i+1), 'content' => trim($c)]; }
+        } else {
+            foreach ($chunks as $chunk) {
+                if (strlen(trim($chunk)) < 150) continue;
+                $lines = array_filter(explode("\n", trim($chunk)));
+                $chapters[] = ['title' => Str::limit(reset($lines), 60), 'content' => trim($chunk)];
             }
         }
 
         $this->process($signal, $chapters);
     }
 
-    /**
-     * Executes the expert analysis for each chapter.
-     */
-/**
-     * Executes the expert analysis for each chapter using a Single-Pass JSON approach.
-     */
     public function process(IngestSignal $signal, array $chapters)
     {
-        // Wir holen nur aktive Agenten, um den Prompt nicht unnötig aufzublähen
         $agents = Agent::where('is_active', true)->get();
         $signal->update(['master_blob_draft' => ""]); 
 
-        // Die Agent-Definitionen aus allen 3 Bausteinen (Soul, Angles, Instructions) zusammensetzen
         $agentDefinitions = $agents->map(function ($agent) {
-            
-            // 1. Die Persona/Rolle (Wer ist der Agent?)
-            // Fallback auf 'Domain Expert', falls die Soul leer ist
             $role = $agent->soul ?? 'Domain Expert';
-            
-            // 2. Die harten Fokus-Themen aus dem Repeater (Wonach sucht er?)
-            $perspectivesArray = $agent->perspectives ?? []; 
-            $topicsText = "";
-            
-            if (is_array($perspectivesArray) && count($perspectivesArray) > 0) {
-                $angles = collect($perspectivesArray)->pluck('angle')->filter()->implode(', ');
-                if (!empty($angles)) {
-                    $topicsText = "\n  Focus EXCLUSIVELY on: {$angles}.";
-                }
-            }
-            
-            // 3. Die spezifischen Extraktionsanweisungen (Wie soll er arbeiten?)
-            $instructions = $agent->system_prompt ? "\n  Extraction Instructions: {$agent->system_prompt}" : "";
-            
-            // Alles zu einem kugelsicheren Block verschmelzen
-            return "- **{$agent->name}** (Role: {$role}){$topicsText}{$instructions}";
-            
+            $angles = collect($agent->perspectives)->pluck('angle')->filter()->implode(', ');
+            $topics = !empty($angles) ? "\n  Focus: {$angles}." : "";
+            $instr = $agent->system_prompt ? "\n  Instructions: {$agent->system_prompt}" : "";
+            return "- **{$agent->name}** (Role: {$role}){$topics}{$instr}";
         })->implode("\n\n");
 
-        $agentNames = $agents->pluck('name')->toArray();
-
-        // 1. SCHRITT: JSON Schema definieren (Zwingt Gemini in ein hartes Format)
-        // Wir erzeugen dynamisch die erwarteten JSON-Keys für jeden Agenten
         $jsonSchemaProperties = [];
-        foreach ($agentNames as $name) {
-            $key = strtolower(str_replace(' ', '_', $name)) . '_notes';
-            $jsonSchemaProperties[$key] = [
-                'type' => 'string',
-                'description' => "Insights from {$name}'s perspective. Use strictly Markdown. If NO relevant data for {$name} is present in the text, output exactly: 'NULL'."
-            ];
+        foreach ($agents as $agent) {
+            $key = strtolower(str_replace(' ', '_', $agent->name)) . '_notes';
+            $jsonSchemaProperties[$key] = ['type' => 'string', 'description' => "Insights from {$agent->name}"];
         }
-
-        $jsonSchema = [
-            'type' => 'object',
-            'properties' => $jsonSchemaProperties,
-            // Wir erzwingen nicht alle Felder (optional), falls ein Agent nichts zu sagen hat
-        ];
 
         foreach ($chapters as $index => $chapter) {
-            $title = $chapter['title'] ?? "Section " . ($index + 1);
-            $content = $chapter['content'] ?? "";
+            $prompt = "Analyze chunk simultaneously:\nEXPERTS:\n{$agentDefinitions}\n\nCHUNK:\n" . Str::limit($chapter['content'], 25000);
+            $jsonResponse = $this->askStructured('analysis', null, $prompt, ['type' => 'object', 'properties' => $jsonSchemaProperties], $signal);
 
-            $this->log($signal, "📘 ANALYZING: '{$title}' (Single-Pass)", 'info');
-            
-            // --- DER SINGLE-PASS PROMPT ---
-            $prompt = "You are the Acado Refinery central processor.\n\n" .
-                      "Your task is to analyze the following document chunk simultaneously from the perspectives of multiple domain experts.\n\n" .
-                      "EXPERTS & FOCUS AREAS:\n{$agentDefinitions}\n\n" .
-                      "STRICT INSTRUCTIONS:\n" .
-                      "- Act as each expert independently.\n" .
-                      "- Extract ONLY hard facts, heuristcs, numbers, and actionable strategies relevant to that expert's focus.\n" .
-                      "- Do NOT write introductory fluff (e.g., 'Here are the notes...').\n" .
-                      "- If the text contains NO relevant data for a specific expert, you MUST return the exact string 'NULL' for that expert's key.\n\n" .
-                      "-Do NOT force a connection. If the data is only tangentially related or generic (e.g. bibliographies, table of contents), output 'NULL'. Require a HIGH threshold of relevance.\n\n" .
-                      "-Ignore publishing metadata, ISBNs, and copyright contact info.\n\n" .
-                      "DOCUMENT CHUNK:\n" . Str::limit($content, 25000); // 25k limit to stay safe within token limits
-
-            // 2. SCHRITT: Den modifizierten ask-Call abfeuern (mit JSON-Zwang)
-            $this->log($signal, "📡 Sending single request to API (JSON-Mode)...", 'info');
-            
-            // Wir nutzen eine spezielle ask-Methode für strukturierten Output (siehe unten)
-            $jsonResponse = $this->askStructured('analysis', null, $prompt, $jsonSchema, $signal);
-
-            if (!$jsonResponse) {
-                $this->log($signal, "🛑 API returned empty JSON or failed. Skipping chapter.", 'error');
-                continue; // Skip to next chapter if API fails completely
-            }
-
-            $chapterHasContent = false;
-            $chapterBuffer = "# {$title}\n\n";
-
-            // 3. SCHRITT: Das JSON entpacken und den Master-Blob bauen
-            $parsedData = json_decode($jsonResponse, true);
-
-            if (json_last_error() === JSON_ERROR_NONE && is_array($parsedData)) {
+            if ($jsonResponse) {
+                $parsedData = json_decode($jsonResponse, true);
+                $chapterBuffer = "# " . ($chapter['title'] ?? 'Section') . "\n\n";
                 foreach ($agents as $agent) {
                     $key = strtolower(str_replace(' ', '_', $agent->name)) . '_notes';
-                    
-                    if (isset($parsedData[$key])) {
-                        $votum = trim($parsedData[$key]);
-
-                        // Prüfen, ob der Agent relevantes gefunden hat (Nicht "NULL" oder leer)
-                        if ($votum !== 'NULL' && $votum !== '' && strtolower($votum) !== 'null') {
-                            $chapterBuffer .= "## {$agent->name}'s Brief\n\n{$votum}\n\n---\n\n";
-                            $chapterHasContent = true;
-                            $this->log($signal, "🧠 Brief secured for {$agent->name}.", 'done');
-                        } else {
-                            $this->log($signal, "⚪ {$agent->name} found no domain data.");
-                        }
+                    if (isset($parsedData[$key]) && $parsedData[$key] !== 'NULL') {
+                        $chapterBuffer .= "## {$agent->name}'s Brief\n\n{$parsedData[$key]}\n\n---\n\n";
                     }
                 }
-            } else {
-                 $this->log($signal, "❌ Failed to parse JSON from API.", 'error');
+                $signal->update(['master_blob_draft' => $signal->master_blob_draft . $chapterBuffer]);
             }
-
-            // Nur wenn mindestens ein Agent echten Content geliefert hat, schreiben wir das Kapitel
-            if ($chapterHasContent) {
-                $this->appendToBlob($signal, $chapterBuffer);
-            }
-            
-            // 4. SCHRITT: Das Rate-Limit-Sicherheitsnetz
-            // WICHTIG: 4 Sekunden Pause zwingend einhalten wegen des 15 RPM Limits im Free Tier
-            $this->log($signal, "⏱️ Enforcing 4s Free-Tier cool-down...", 'info');
-            sleep(4); 
+            sleep(4);
         }
-
         $signal->update(['status' => 'done']);
-        $this->log($signal, "🏁 FINISH: Boardroom concluded.", 'done');
     }
-        
 
-    protected function appendToBlob(IngestSignal $signal, string $text)
+    protected function extractPdfLocally(string $path, IngestSignal $signal): string
     {
-        $signal->refresh();
-        $signal->update(['master_blob_draft' => ($signal->master_blob_draft ?? "") . $text]);
+        $output = []; $returnVar = -1;
+        exec("pdftotext -layout " . escapeshellarg($path) . " -", $output, $returnVar);
+        $text = ($returnVar === 0) ? implode("\n", $output) : "";
+        if (empty($text)) {
+            try { $text = (new Parser())->parseFile($path)->getText(); } catch (\Throwable $t) {}
+        }
+        return trim(preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/u', '', mb_convert_encoding($text, 'UTF-8', 'UTF-8')));
     }
-
 }
