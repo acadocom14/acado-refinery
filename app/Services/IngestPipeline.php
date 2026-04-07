@@ -178,72 +178,202 @@ class IngestPipeline
     }
 
     /**
-     * DER HAUPTMOTOR FÜR DIE ASSET-FABRIK (Queue Ready)
+     * DER HAUPTMOTOR FÜR DIE ASSET-FABRIK (V3.1 - AUTONOMOUS FEEDBACK LOOP)
      */
     public function processAssetPipeline(Asset $asset)
     {
         $separator = str_repeat("=", 60);
         $this->log($asset, $separator);
-        $this->log($asset, "INITIALIZING ACADO ASSET REFINERY v2.5", 'info');
+        $this->log($asset, "INITIALIZING ACADO ASSET REFINERY v3.1 (AGENTIC LOOP)", 'info');
         $this->log($asset, "TARGET ASSET: " . strtoupper($asset->name), 'info');
+
+        if (empty($asset->trigger_content)) {
+            $this->log($asset, "CRITICAL: NO TRIGGER CONTENT FOUND. ABORTING.", 'error');
+            return $asset->update(['status' => 'failed']);
+        }
+
+        $this->log($asset, "TRIGGER RECEIVED: " . Str::limit($asset->trigger_content, 50), 'done');
         $this->log($asset, $separator);
 
         $asset->update(['status' => 'processing']);
         $stages = $asset->pipelineStages()->orderBy('stage_level', 'asc')->get();
-        
+
         if ($stages->isEmpty()) {
             $this->log($asset, "CRITICAL: NO PIPELINE STAGES DEFINED", 'error');
             return $asset->update(['status' => 'failed']);
         }
 
         $allSignals = $asset->ingestSignals ?? collect();
-        $chainedOutput = ""; 
 
-        foreach ($stages as $stage) {
+        // =====================================================================
+        // 🔄 STATE MANAGEMENT FÜR DEN LOOPBACK
+        // =====================================================================
+        $stageOutputs = [];
+        $stageOutputs[-1] = $asset->trigger_content; 
+    
+        $rejectionFeedback = ""; 
+        $loopbackCount = 0;      
+        $maxLoopbacks = 3;       
+
+        for ($i = 0; $i < count($stages); $i++) {
+            $stage = $stages[$i];
+            $chainedOutput = $stageOutputs[$i - 1]; 
+
             $this->log($asset, "--- LOADING STAGE {$stage->stage_level}: " . strtoupper($stage->name) . " ---", 'info');
-            
+    
             $activeAgent = $stage->agents->first();
             if ($activeAgent) {
                 $this->log($asset, "DEPLOYING AGENT: {$activeAgent->name}", 'warning');
             }
 
-            $externalContext = match($stage->signal_filter) {
-                'fach'     => $allSignals->where('type', 'fach')->pluck('master_blob_draft')->filter()->implode("\n\n---\n\n"),
-                'business' => $allSignals->where('type', 'business')->pluck('master_blob_draft')->filter()->implode("\n\n---\n\n"),
-                'poesie'   => $allSignals->where('type', 'poesie')->pluck('master_blob_draft')->filter()->implode("\n\n---\n\n"),
-                'all'      => $allSignals->pluck('master_blob_draft')->filter()->implode("\n\n---\n\n"),
-                default    => "",
+            // =====================================================================
+            // 🛰️ KNOWLEDGE RETRIEVAL ÜBER 'CATEGORY' (v3.4)
+            // =====================================================================
+            $allSignals = collect($asset->ingestSignals ?? []);
+
+            $knowledgeBase = match($stage->signal_filter) {
+                // Wir suchen in der Spalte 'category'
+                'tech'  => $allSignals->filter(function($s) {
+                    $c = strtolower($s->category ?? '');
+                    return str_contains($c, 'tech') || str_contains($c, 'specialist') || str_contains($c, 'fach');
+                })->pluck('master_blob_draft')->filter()->implode("\n\n---\n\n"),
+
+                'biz'   => $allSignals->filter(function($s) {
+                    $c = strtolower($s->category ?? '');
+                    return str_contains($c, 'biz') || str_contains($c, 'business') || str_contains($c, 'wirtschaft');
+                })->pluck('master_blob_draft')->filter()->implode("\n\n---\n\n"),
+
+                'philo' => $allSignals->filter(function($s) {
+                    $c = strtolower($s->category ?? '');
+                    return str_contains($c, 'philo') || str_contains($c, 'poes') || str_contains($c, 'verse') || str_contains($c, 'lyrik');
+                })->pluck('master_blob_draft')->filter()->implode("\n\n---\n\n"),
+
+                'all'   => $allSignals->pluck('master_blob_draft')->filter()->implode("\n\n---\n\n"),
+                default => "",
             };
 
-            if (empty($externalContext) && $stage->signal_filter !== 'previous_only') {
-                $externalContext = "RESERVE_DATA: " . ($asset->description ?? $asset->name);
-                $this->log($asset, "Utilizing Asset Fallback Data.", 'info');
+            // Korrigiertes Debug-Logging
+            $foundCount = $allSignals->filter(function($s) use ($stage) {
+                $c = strtolower($s->category ?? '');
+                if($stage->signal_filter == 'tech') return str_contains($c, 'tech') || str_contains($c, 'specialist');
+                if($stage->signal_filter == 'biz') return str_contains($c, 'biz') || str_contains($c, 'business');
+                return $s->category == $stage->signal_filter;
+            })->count();
+
+            $this->log($asset, "DEBUG: Total Signals linked: " . $allSignals->count(), 'info');
+            $this->log($asset, "DEBUG: Category-Matches for '{$stage->signal_filter}': " . $foundCount, 'info');
+
+            $kbLength = strlen($knowledgeBase);
+            if ($kbLength > 0) {
+                $this->log($asset, "📚 KNOWLEDGE INJECTED: " . number_format($kbLength, 0, ',', '.') . " Chars", 'done');
+            } else {
+                $this->log($asset, "📭 NO KNOWLEDGE INJECTED (Filter: {$stage->signal_filter})", 'warning');
             }
 
-            $stageInput = "--- EXTERNAL DATA ---\n{$externalContext}\n\n--- PREVIOUS OUTPUT ---\n{$chainedOutput}";
-            $chunks = $this->splitIntoChunks($stageInput);
+      
+
+            $knowledgeChunks = $this->splitIntoChunks($knowledgeBase, 150000);
+            if (empty($knowledgeChunks)) {
+                $knowledgeChunks = ['']; 
+            }
+
             $responses = [];
+            $stageSuccess = true; 
 
-            foreach ($chunks as $idx => $chunk) {
-                $this->log($asset, "Processing Chunk " . ($idx+1) . "/" . count($chunks) . "...", 'info');
-                $prompt = "{$stage->fixed_prompt_template}\n\nDIRECTIVE: {$stage->custom_prompt_directive}\n\nCONTEXT:\n{$chunk}";
-                
+            foreach ($knowledgeChunks as $idx => $chunk) {
+                $chunkLabel = count($knowledgeChunks) > 1 ? " (Part " . ($idx+1) . "/" . count($knowledgeChunks) . ")" : "";
+                $this->log($asset, "Processing Execution{$chunkLabel}...", 'info');
+        
+                $knowledgeInject = !empty($chunk) ? "### REFERENCE KNOWLEDGE (Expert Library) ###\n{$chunk}" : "";
+
+                $feedbackInject = "";
+                if (!empty($rejectionFeedback)) {
+                    $feedbackInject = "\n\n=========================================\n" .
+                                      "⚠️ URGENT REVISION REQUIRED (FEEDBACK FROM LATER STAGE):\n" .
+                                      "Your previous output was rejected. You MUST fix these issues:\n" .
+                                      "REASON: {$rejectionFeedback}\n" .
+                                      "=========================================\n";
+                }
+
+                $prompt = "{$stage->fixed_prompt_template}\n\n" .
+                          "DIRECTIVE: {$stage->custom_prompt_directive}\n" .
+                          $feedbackInject . "\n" .
+                          "### SUBJECT TO ANALYZE (Current Progress) ###\n" .
+                          "{$chainedOutput}\n\n" .
+                          $knowledgeInject;
+        
                 $res = $this->ask('analysis', $activeAgent, $prompt, $asset);
-                if ($res) $responses[] = $res;
-                
-                $this->log($asset, "Enforcing 4s API cool-down...", 'info');
-                sleep(4); 
+            
+                if ($res) {
+                    $cleanJson = trim(preg_replace('/^```json\s*(.*?)\s*```$/is', '$1', $res));
+                    $parsedData = json_decode($cleanJson, true);
+
+                    if (json_last_error() === JSON_ERROR_NONE && isset($parsedData['gatekeeper_decision'])) {
+                    
+                        $decision = strtoupper($parsedData['gatekeeper_decision']);
+                        $reason = $parsedData['reason'] ?? 'Sicherheitsrisiko durch Gatekeeper erkannt.';
+
+                        if ($decision === 'BLOCK' || $decision === 'RED') {
+                            if ($loopbackCount < $maxLoopbacks && $i > 0) {
+                                $loopbackCount++;
+                                $rejectionFeedback = $reason; 
+                            
+                                $this->log($asset, "🔄 [GATEKEEPER REJECTED] Bouncing back to Stage " . ($stages[$i-1]->stage_level) . " (Attempt {$loopbackCount}/{$maxLoopbacks}). Reason: " . $reason, 'error');
+                            
+                                $stageSuccess = false;
+                                $i -= 2; 
+                                break; 
+                            } else {
+                                $asset->update([
+                                    'status' => 'failed',
+                                    'final_content' => "## 🛑 FATAL PIPELINE BLOCK\n**Stage:** {$stage->name}\n**Grund:** {$reason}\n*(Abgebrochen nach {$loopbackCount} Korrekturversuchen)*"
+                                ]);
+                                $this->log($asset, "💀 [GATEKEEPER FATAL] Max retries reached. Pipeline terminated.", 'error');
+                                return; 
+                            }
+                        }
+
+                        if ($decision === 'WARN' || $decision === 'YELLOW') {
+                            $this->log($asset, "⚠️ [GATEKEEPER WARNING] " . $reason, 'warning');
+                        }
+
+                        $res = $parsedData['safe_content'] ?? '';
+                    }
+
+                    if (!empty(trim($res))) {
+                        $responses[] = $res;
+                    }
+                }
+        
+                // Cool-down nur innerhalb der Chunks
+                if (count($knowledgeChunks) > 1) {
+                    $this->log($asset, "Enforcing API cool-down...", 'info');
+                    sleep(4);
+                }
             }
 
+            if (!$stageSuccess) {
+                continue; 
+            }
+
+            $rejectionFeedback = ""; 
+            $loopbackCount = 0;      
+        
             $isJson = Str::contains(strtolower($stage->fixed_prompt_template), 'json');
-            $chainedOutput = $isJson ? "[\n".implode(",\n", $responses)."\n]" : implode("\n\n", $responses);
-            
-            // Speichere Stage-Output für Archiv
-            // Suche diese Stelle:
-            $allOutputs = $asset->pipeline_outputs ?? []; // Sicherstellen, dass es ein Array ist
+            $finalStageOutput = $isJson ? "[\n".implode(",\n", $responses)."\n]" : implode("\n\n", $responses);
+
+            // 🛑 VOID CHECK
+            if (empty(trim($finalStageOutput))) {
+                $this->log($asset, "💀 FATAL: Stage {$stage->stage_level} produced EMPTY output.", 'error');
+                return $asset->update(['status' => 'failed', 'final_content' => "## 🛑 PIPELINE KILLED\nStage '{$stage->name}' hat ein leeres Ergebnis geliefert."]);
+            }
+        
+            $stageOutputs[$i] = $finalStageOutput;
+    
+            $allOutputs = $asset->pipeline_outputs ?? [];
             $allOutputs["stage_{$stage->stage_level}"] = [
                 'name' => $stage->name, 
-                'content' => $chainedOutput
+                'content' => $finalStageOutput
             ];
             $asset->update(['pipeline_outputs' => $allOutputs]);
 
@@ -253,17 +383,9 @@ class IngestPipeline
 
         $this->log($asset, "ALL STAGES PROCESSED. COMPILING FINAL MANIFEST...", 'done');
         $this->log($asset, $separator);
-        
-        // Finales Dokument aus Stage 4 (Compliance) und Stage 5 (Poesie)
+
         $final = ($asset->pipeline_outputs['stage_4']['content'] ?? '') . "\n\n" . ($asset->pipeline_outputs['stage_5']['content'] ?? '');
         $asset->update(['status' => 'active', 'final_content' => $final]);
-    }
-
-    protected function splitIntoChunks(string $text, int $maxChars = 25000): array
-    {
-        if (empty(trim($text))) return [];
-        $chunks = explode("|||", wordwrap($text, $maxChars, "|||"));
-        return array_filter(array_map('trim', $chunks));
     }
 
     /**
@@ -354,4 +476,23 @@ class IngestPipeline
         }
         return trim(preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/u', '', mb_convert_encoding($text, 'UTF-8', 'UTF-8')));
     }
+
+
+    /**
+     * Zerlegt den massiven Wissenstext in Chunks, 
+     * damit Gemini nicht überladen wird.
+     */
+    protected function splitIntoChunks(string $text, int $maxChars = 150000): array
+    {
+        if (empty(trim($text))) {
+            return [];
+        }
+
+        // Wir nutzen eine saubere Zerlegung an Wortgrenzen oder Absätzen
+        // 150.000 Zeichen sind für Gemini 2.5 Flash ein Kinderspiel.
+        $chunks = explode("|||", wordwrap($text, $maxChars, "|||"));
+        
+        return array_filter(array_map('trim', $chunks));
+    }
+
 }
